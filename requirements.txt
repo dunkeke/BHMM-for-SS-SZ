@@ -1,0 +1,4 @@
+akshare
+yfinance 
+hmmlearn 
+plotly
