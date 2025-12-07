@@ -44,43 +44,43 @@ st.markdown("""
 # 1. A股 核心数据引擎 (AkShare + YFinance)
 # ==========================================
 
-@st.cache_data(ttl=24*3600)  # 缓存 24 小时，避免每次刷新都请求接口
+@st.cache_data(ttl=24*3600)  # 缓存 24 小时
 def get_all_a_share_list():
     """
     使用 AkShare 获取全市场实时行情数据，仅提取代码和名称。
     """
     try:
-        # 获取 A 股实时行情 (包含代码、名称)
-        # 这是一个轻量级接口，速度较快
+        # 尝试获取 A 股实时行情
         df = ak.stock_zh_a_spot_em()
         df = df[['代码', '名称']]
-        
-        # 格式化显示列： "600519 | 贵州茅台"
         df['Display'] = df['代码'] + " | " + df['名称']
-        return df
+        return df, True # True 表示获取成功
     except Exception as e:
-        # 如果接口挂了，返回一个保底的小列表
+        # 失败返回保底列表
         fallback_data = {
             "代码": ["600519", "300750", "000001", "000858"],
             "名称": ["贵州茅台", "宁德时代", "平安银行", "五粮液"],
             "Display": ["600519 | 贵州茅台", "300750 | 宁德时代", "000001 | 平安银行", "000858 | 五粮液"]
         }
-        return pd.DataFrame(fallback_data)
+        # 打印错误到日志（方便调试）
+        print(f"AkShare Error: {e}")
+        return pd.DataFrame(fallback_data), False # False 表示使用保底数据
 
 @st.cache_data(ttl=3600)
-def format_ticker_for_yfinance(raw_code, raw_name):
+def format_ticker_for_yfinance(raw_code, raw_name="Unknown"):
     """
-    将 AkShare 的 6 位纯数字代码转换为 YFinance 需要的格式 (.SS/.SZ)
+    将 6 位纯数字代码转换为 YFinance 需要的格式 (.SS/.SZ)
     """
+    raw_code = str(raw_code).strip()
     # 规则判断
     if raw_code.startswith("6"):
         suffix = ".SS" # 沪市主板/科创板
     elif raw_code.startswith("9"):
-        suffix = ".SS" # 沪市B股 (极少用)
+        suffix = ".SS" # 沪市B股
     elif raw_code.startswith("0") or raw_code.startswith("3"):
         suffix = ".SZ" # 深市/创业板
     elif raw_code.startswith("4") or raw_code.startswith("8"):
-        suffix = ".BJ" # 北交所 (注意：YFinance 对北交所支持较差，可能会获取失败)
+        suffix = ".BJ" # 北交所
     else:
         suffix = ".SS" # 默认回退
         
@@ -97,7 +97,6 @@ def get_data(ticker, start, end):
         if df.empty or len(df) < 10:
             base_code = ticker.split('.')[0]
             current_suffix = '.' + ticker.split('.')[1]
-            # 简单的互换逻辑
             alt_suffix = '.SZ' if current_suffix == '.SS' else '.SS'
             alt_ticker = base_code + alt_suffix
             
@@ -135,27 +134,43 @@ with st.sidebar:
     
     # 获取全市场列表 (带缓存)
     with st.spinner("正在加载 A 股全市场列表..."):
-        stock_list_df = get_all_a_share_list()
+        stock_list_df, is_online = get_all_a_share_list()
     
-    # 使用 Selectbox 实现搜索功能
-    # Streamlit 的 Selectbox 原生支持输入文字进行过滤，非常适合这个场景
-    selected_option = st.selectbox(
-        "输入代码或名称搜索 (支持 5000+ 只股票)",
-        options=stock_list_df['Display'],
-        index=0, # 默认选中第一个
-        help="数据来源: AkShare (实时更新)"
-    )
+    target_ticker = None
+    target_name = None
+
+    # === 关键修改：自动降级逻辑 ===
+    if is_online:
+        # 正常模式：显示 5000+ 股票的下拉框
+        selected_option = st.selectbox(
+            "输入代码或名称搜索",
+            options=stock_list_df['Display'],
+            index=0,
+            help="数据来源: AkShare (实时更新)"
+        )
+        if selected_option:
+            code_part = selected_option.split(" | ")[0]
+            name_part = selected_option.split(" | ")[1]
+            target_ticker, target_name = format_ticker_for_yfinance(code_part, name_part)
+            st.info(f"已锁定: **{name_part}** ({target_ticker})")
     
-    # 解析用户的选择
-    if selected_option:
-        # split "600519 | 贵州茅台"
-        code_part = selected_option.split(" | ")[0]
-        name_part = selected_option.split(" | ")[1]
+    else:
+        # 降级模式：网络不通，显示手动输入框
+        st.warning("⚠️ 无法连接到股票列表服务器 (可能受网络限制)，已切换至**手动输入模式**。")
         
-        # 转换为 YF 格式
-        target_ticker, target_name = format_ticker_for_yfinance(code_part, name_part)
-        st.info(f"已锁定: **{name_part}** ({target_ticker})")
-    
+        col_input, col_help = st.columns([0.85, 0.15])
+        with col_input:
+            manual_code = st.text_input("请输入6位股票代码", value="002340", placeholder="例如 600519")
+        
+        if manual_code:
+            # 简单的校验
+            import re
+            if re.match(r"^\d{6}$", manual_code):
+                target_ticker, target_name = format_ticker_for_yfinance(manual_code, f"Code: {manual_code}")
+                st.info(f"已解析: **{target_ticker}**")
+            else:
+                st.caption("❌ 请输入正确的 6 位数字代码")
+
     st.divider()
 
     st.subheader("2. 模型参数 (HMM)")
@@ -358,7 +373,7 @@ else:
     
     with st.expander("📖 搜索提示"):
         st.markdown("""
-        **AkShare 全量数据支持**：
-        - 下拉框已包含全市场 5000+ 股票。
-        - 可以在下拉框中**直接输入**代码（如 `600`）或中文（如 `茅台`）进行模糊筛选。
+        **网络连接提示**：
+        - 如果能连接到 AkShare 服务器，您将看到全市场下拉框。
+        - 如果连接失败（如在防火墙内），系统会自动切换到**手动输入框**，您直接输入 6 位代码即可（如 `002340`）。
         """)
