@@ -296,8 +296,17 @@ elif mode == "📈 单标的深度分析 (Deep Dive)":
                     mode='markers', marker=dict(color=colors[i], size=3),
                     name=f"Regime {i}"
                 ), row=1, col=1)
-                
-            fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Close'], line=dict(color='gray', width=1, opacity=0.5), showlegend=False), row=1, col=1)
+            
+            # --- 修复部分 ---
+            # 原错误代码: line=dict(..., opacity=0.5) 导致 opacity 传入了 dict
+            # 修复后: opacity 作为 go.Scatter 的一级参数
+            fig.add_trace(go.Scatter(
+                x=df_res.index, 
+                y=df_res['Close'], 
+                line=dict(color='gray', width=1), 
+                opacity=0.5, # 移到了这里
+                showlegend=False
+            ), row=1, col=1)
             
             # 资金曲线
             fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Equity_Curve'], name="策略净值", line=dict(color='red', width=2)), row=2, col=1)
