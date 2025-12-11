@@ -12,47 +12,80 @@ import warnings
 try:
     from robustness import RobustnessLab
 except ImportError:
-    st.error("⚠️ 缺少 robustness.py 文件，无法运行鲁棒性测试模块。")
+    pass # 鲁棒性模块为可选
 
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. A股配置与板块数据 (Sector Data)
+# 0. 全局配置
 # ==========================================
-st.set_page_config(page_title="A-Share Alpha Scanner", layout="wide", page_icon="🇨🇳")
+st.set_page_config(page_title="A-Share AI Quant Pro", layout="wide", page_icon="🇨🇳")
 
-# A股核心板块成分股 (精选龙头，用于扫描演示)
+# A股核心板块 (用于扫描)
 SECTORS = {
-    "茅指数 (核心资产)": {
-        "贵州茅台": "600519.SS", "五粮液": "000858.SZ", "招商银行": "600036.SS", 
-        "中国平安": "601318.SS", "恒瑞医药": "600276.SS", "美的集团": "000333.SZ"
-    },
-    "宁组合 (新能源/科技)": {
-        "宁德时代": "300750.SZ", "比亚迪": "002594.SZ", "隆基绿能": "601012.SS", 
-        "阳光电源": "300274.SZ", "立讯精密": "002475.SZ", "北方华创": "002371.SZ"
-    },
-    "中特估 (高股息)": {
-        "长江电力": "600900.SS", "中国神华": "601088.SS", "中国移动": "600941.SS", 
-        "农业银行": "601288.SS", "陕西煤业": "601225.SS", "大秦铁路": "601006.SS"
-    }
+    "茅指数 (核心资产)": ["600519.SS", "000858.SZ", "600036.SS", "601318.SS", "600276.SS", "000333.SZ"],
+    "宁组合 (新能源)": ["300750.SZ", "002594.SZ", "601012.SS", "300274.SZ", "002475.SZ", "002371.SZ"],
+    "中特估 (红利)": ["600900.SS", "601088.SS", "600941.SS", "601288.SS", "601225.SS", "601006.SS"],
+    "AI算力 (TMT)": ["601138.SS", "002230.SZ", "603019.SS", "000977.SZ", "300308.SZ", "002920.SZ"]
 }
 
-# A股费率设置 (印花税+佣金+滑点，保守估计万5)
+# A股交易成本 (双边万5 + 滑点)
 ASHARE_COST = 0.0005
 
 # ==========================================
-# PART 1: 策略适配 (Long-Only Adapter)
+# PART 1: 策略工厂 (Strategy Zoo for A-Share)
 # ==========================================
 
 class StrategyBase:
+    """策略基类"""
     def generate_signals(self, df): raise NotImplementedError
+
+class HMMStandardAshare(StrategyBase):
+    """
+    [经典策略 - A股版]
+    逻辑: 低波(State 0) -> 买入, 高波(State 2) -> 卖出/空仓
+    适配: 只能做多 (Signal >= 0)
+    """
+    def __init__(self, n_components=3, iter_num=1000, window_size=21, **kwargs):
+        self.n_components = n_components
+        self.iter_num = iter_num
+        self.window_size = window_size
+
+    def generate_signals(self, df):
+        df = df.copy()
+        df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
+        df['Volatility'] = df['Log_Ret'].rolling(window=self.window_size).std()
+        df.dropna(inplace=True)
+        if len(df) < 60: return df
+        
+        X = df[['Log_Ret', 'Volatility']].values * 100.0
+        try:
+            model = GaussianHMM(n_components=self.n_components, covariance_type="full", n_iter=self.iter_num, random_state=42, tol=0.01, min_covar=0.01)
+            model.fit(X)
+        except: return df
+        
+        hidden_states = model.predict(X)
+        # 按波动率排序状态
+        state_vol_means = [X[hidden_states == i, 1].mean() for i in range(self.n_components)]
+        sorted_stats = sorted(list(enumerate(state_vol_means)), key=lambda x: x[1])
+        mapping = {old: new for new, (old, _) in enumerate(sorted_stats)}
+        df['Regime'] = np.array([mapping[s] for s in hidden_states])
+        
+        # A股逻辑: Regime 0 (低波) -> 买入; Regime 2 (高波) -> 卖出
+        df['Signal'] = 0
+        df.loc[df['Regime'] == 0, 'Signal'] = 1   
+        # 其他状态保持 0 (空仓)
+        
+        # 补充字段用于 AI 分析
+        df['Bayes_Exp_Ret'] = 0.0 # 标准版不计算贝叶斯
+        df['Strategy_Type'] = 'Standard'
+        return df
 
 class HMMAdaptiveAshare(StrategyBase):
     """
-    [A股特供版] HMM 自适应策略
-    特点: 
-    1. 只能做多 (Long Only): 信号 -1 强制转为 0 (空仓)
-    2. 贝叶斯后验优化
+    [自适应策略 - A股版]
+    逻辑: 基于贝叶斯后验期望收益 > 阈值 -> 买入
+    适配: Long Only
     """
     def __init__(self, n_components=3, iter_num=1000, window_size=21, threshold=0.0003, **kwargs):
         self.n_components = n_components
@@ -62,30 +95,22 @@ class HMMAdaptiveAshare(StrategyBase):
 
     def generate_signals(self, df):
         df = df.copy()
-        # 基础特征工程
         df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
         df['Volatility'] = df['Log_Ret'].rolling(window=self.window_size).std()
-        
-        # A股特色因子：量比 (成交量/5日均量) - 辅助判断活跃度
-        df['Vol_Ratio'] = df['Volume'] / df['Volume'].rolling(5).mean()
-        
         df.dropna(inplace=True)
-        if len(df) < 60: return df # A股新股数据保护
+        if len(df) < 60: return df
         
-        # HMM 训练
         X = df[['Log_Ret', 'Volatility']].values * 100.0
         try:
             model = GaussianHMM(n_components=self.n_components, covariance_type="full", n_iter=self.iter_num, random_state=88, tol=0.01, min_covar=0.01)
             model.fit(X)
         except: return df
         
-        # 状态排序 (按波动率从小到大: 0=低波/吸筹, N=高波/出货)
         hidden_states = model.predict(X)
         state_vol_means = [X[hidden_states == i, 1].mean() for i in range(self.n_components)]
         sorted_stats = sorted(list(enumerate(state_vol_means)), key=lambda x: x[1])
         mapping = {old: new for new, (old, _) in enumerate(sorted_stats)}
         
-        # 贝叶斯推断
         posterior_probs = model.predict_proba(X)
         sorted_probs = np.zeros_like(posterior_probs)
         for old_i, new_i in mapping.items():
@@ -93,13 +118,11 @@ class HMMAdaptiveAshare(StrategyBase):
             
         df['Regime'] = np.array([mapping[s] for s in hidden_states])
         
-        # 计算各状态历史平均收益 (Priors)
         state_means = []
         for i in range(self.n_components):
             mean_ret = df[df['Regime'] == i]['Log_Ret'].mean()
             state_means.append(mean_ret)
-            
-        # 转移矩阵映射与预测
+        
         new_transmat = np.zeros_like(model.transmat_)
         for i in range(self.n_components):
             for j in range(self.n_components):
@@ -108,243 +131,270 @@ class HMMAdaptiveAshare(StrategyBase):
         next_probs = np.dot(sorted_probs, new_transmat)
         df['Bayes_Exp_Ret'] = np.dot(next_probs, state_means)
         
-        # --- A股 信号生成逻辑 (Long Only) ---
+        # A股逻辑: Alpha > 阈值 -> 买入; 否则空仓
         df['Signal'] = 0
-        # 买入条件: 预期收益 > 阈值
         df.loc[df['Bayes_Exp_Ret'] > self.threshold, 'Signal'] = 1
-        # 卖出条件: 预期收益 < -阈值 (转为0，即空仓)
-        df.loc[df['Bayes_Exp_Ret'] < -self.threshold, 'Signal'] = 0 
         
+        df['Strategy_Type'] = 'Adaptive'
+        return df
+
+class HMM_MACD_Ashare(StrategyBase):
+    """
+    [MACD共振策略 - A股版]
+    逻辑: HMM 看多 + MACD 金叉 -> 买入
+    """
+    def __init__(self, n_components=3, iter_num=1000, window_size=21, **kwargs):
+        self.n_components = n_components
+        self.iter_num = iter_num
+        self.window_size = window_size
+
+    def calculate_macd(self, df):
+        # 使用日线 MACD (为了简化计算，不请求4H数据，直接用日线)
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        dif = exp1 - exp2
+        dea = dif.ewm(span=9, adjust=False).mean()
+        hist = (dif - dea) * 2
+        return hist, dif
+
+    def generate_signals(self, df):
+        # 1. 先跑基础 HMM 自适应
+        base_strat = HMMAdaptiveAshare(self.n_components, self.iter_num, self.window_size)
+        df = base_strat.generate_signals(df)
+        if 'Signal' not in df.columns: return df
+        
+        # 2. 计算 MACD
+        hist, dif = self.calculate_macd(df)
+        df['MACD_Hist'] = hist
+        df['MACD_DIF'] = dif
+        
+        # 3. 共振逻辑
+        # 原始 HMM 信号为 1 (看多) 且 MACD 红柱扩大或为正 -> 买入
+        # 如果 HMM 看多 但 MACD 死叉 -> 观望 (Signal=0)
+        
+        df['HMM_Signal'] = df['Signal'] # 备份 HMM 信号
+        df['Signal'] = 0 # 重置
+        
+        # 买入条件: HMM看多 且 (MACD柱子 > 0)
+        buy_condition = (df['HMM_Signal'] == 1) & (df['MACD_Hist'] > 0)
+        df.loc[buy_condition, 'Signal'] = 1
+        
+        df['Strategy_Type'] = 'MACD_Resonance'
         return df
 
 # ==========================================
-# PART 2: 扫描器引擎 (Scanner Engine)
+# PART 2: AI 智能投顾模块 (核心新增)
 # ==========================================
 
-def run_scanner(sector_dict, start_date, end_date):
+class AI_Investment_Advisor:
     """
-    全市场扫描核心逻辑
-    遍历板块个股 -> 训练HMM -> 提取当前状态与预期收益 -> 排序
+    AI 投资顾问: 将量化数据翻译为人类可读的投资建议
     """
-    results = []
-    
-    # 创建进度条
-    progress_bar = st.progress(0)
-    total = len(sector_dict)
-    
-    for idx, (name, ticker) in enumerate(sector_dict.items()):
-        try:
-            # 下载数据
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            
-            if not df.empty and len(df) > 100:
-                # 运行 HMM
-                strat = HMMAdaptiveAshare(window_size=20)
-                df_res = strat.generate_signals(df)
-                
-                if 'Regime' in df_res.columns:
-                    last_row = df_res.iloc[-1]
-                    
-                    # 评分逻辑: 预期收益 * 10000 (bps)
-                    score = last_row['Bayes_Exp_Ret'] * 10000
-                    
-                    # 状态解读
-                    regime = int(last_row['Regime'])
-                    status = "🟢 底部/拉升" if regime == 0 else ("🔴 顶部/巨震" if regime == 2 else "🟡 震荡/中继")
-                    
-                    results.append({
-                        "名称": name,
-                        "代码": ticker,
-                        "当前价格": f"{last_row['Close']:.2f}",
-                        "HMM状态": status,
-                        "RegimeID": regime,
-                        "预期Alpha (bps)": f"{score:.2f}",
-                        "Raw_Alpha": last_row['Bayes_Exp_Ret'],
-                        "建议": "💪 强力买入" if (regime == 0 and score > 5) else ("👀 关注" if score > 0 else "🛑 观望")
-                    })
-        except Exception as e:
-            pass
-            
-        progress_bar.progress((idx + 1) / total)
+    @staticmethod
+    def analyze(df, metrics, strategy_type):
+        last = df.iloc[-1]
+        regime = int(last['Regime'])
+        signal = int(last['Signal'])
+        alpha = last.get('Bayes_Exp_Ret', 0)
         
-    return pd.DataFrame(results)
+        # 1. 市场状态画像
+        regime_desc = {
+            0: "🌱 底部/吸筹 (Low Volatility)",
+            1: "🌊 趋势/中继 (Medium Volatility)", 
+            2: "🌪️ 顶部/风险 (High Volatility)"
+        }
+        market_status = regime_desc.get(regime, "未知状态")
+        
+        # 2. 策略逻辑解释
+        logic_expl = ""
+        if strategy_type == 'Standard':
+            logic_expl = "经典轮动逻辑：当前处于" + ("低波稳态，符合买入条件。" if regime==0 else "高波/震荡态，建议空仓防御。")
+        elif strategy_type == 'Adaptive':
+            logic_expl = f"贝叶斯概率逻辑：模型预测次日具有 {'正向' if alpha>0 else '负向'} 预期收益 (Alpha={alpha*100:.3f}%)，" + ("资金做多意愿强。" if signal==1 else "风险溢价不足，建议观望。")
+        elif strategy_type == 'MACD_Resonance':
+            macd_val = last.get('MACD_Hist', 0)
+            logic_expl = f"趋势共振逻辑：HMM 宏观判断{'看多' if last.get('HMM_Signal',0)==1 else '看空'}，叠加 MACD 技术面{'金叉(红柱)' if macd_val>0 else '死叉(绿柱)'}。" + ("双重验证通过，强烈看多。" if signal==1 else "共振失败，保持防守。")
+
+        # 3. 最终行动建议
+        advice_card = {
+            "action_title": "",
+            "action_color": "",
+            "bg_color": "",
+            "summary": "",
+            "risk_warning": ""
+        }
+        
+        if signal == 1:
+            advice_card['action_title'] = "🚀 强力买入 / 持股 (LONG)"
+            advice_card['action_color'] = "#00E676" # Green
+            advice_card['bg_color'] = "rgba(0, 230, 118, 0.1)"
+            advice_card['summary'] = f"**{market_status}**。{logic_expl} 量化信号积极，建议建立多头仓位。"
+            advice_card['risk_warning'] = "止损建议：若收盘价跌破20日均线，或HMM状态跳变为State 2，立即离场。"
+        else:
+            advice_card['action_title'] = "🛡️ 空仓观望 / 卖出 (CASH)"
+            advice_card['action_color'] = "#FF5252" # Red
+            advice_card['bg_color'] = "rgba(255, 82, 82, 0.1)"
+            advice_card['summary'] = f"**{market_status}**。{logic_expl} 量化信号转弱或风险过高，建议持有现金。"
+            advice_card['risk_warning'] = "观察建议：等待HMM状态回归State 0，或预期Alpha转正后再行介入。"
+            
+        return advice_card
 
 # ==========================================
-# PART 3: 回测引擎 (A股 T+1 适配)
+# PART 3: 扫描与回测引擎
 # ==========================================
 
 class AshareBacktestEngine:
-    def __init__(self, initial_capital=100000, transaction_cost=ASHARE_COST):
+    """A股专用回测 (T+1, 无做空)"""
+    def __init__(self, initial_capital=100000, cost=ASHARE_COST):
         self.initial_capital = initial_capital
-        self.cost = transaction_cost
+        self.cost = cost
 
     def run(self, df):
         df = df.copy()
-        # T+1 模拟: T日信号，T+1日执行
-        # Position 代表 T+1 日持仓
-        df['Position'] = df['Signal'].shift(1).fillna(0)
-        
-        # 交易发生时刻 (仓位变动)
+        df['Position'] = df['Signal'].shift(1).fillna(0) # T+1
         trades = df['Position'].diff().abs().fillna(0)
         fees = trades * self.cost
-        
-        # 策略收益 (A股没有做空收益，Position只能是0或1)
         df['Strategy_Ret'] = (df['Position'] * df['Log_Ret']) - fees
-        
         df['Equity_Curve'] = self.initial_capital * (1 + df['Strategy_Ret']).cumprod()
         df['Benchmark_Curve'] = self.initial_capital * (1 + df['Log_Ret']).cumprod()
         return df
+        
+    def calculate_metrics(self, df):
+        if df.empty: return {}
+        total_ret = df['Equity_Curve'].iloc[-1]/self.initial_capital - 1
+        ann_ret = (1+total_ret)**(252/len(df))-1
+        vol = df['Strategy_Ret'].std()*np.sqrt(252)
+        sharpe = (df['Strategy_Ret'].mean()*252)/(vol+1e-8)
+        dd = (df['Equity_Curve']/df['Equity_Curve'].cummax()-1).min()
+        return {"Total Return": total_ret, "CAGR": ann_ret, "Sharpe": sharpe, "Max Drawdown": dd}
 
-# ==========================================
-# PART 4: Streamlit UI
-# ==========================================
-
-st.title("🇨🇳 A-Share Quant Lab: HMM 选股与择时")
-
-# 侧边栏模式选择
-mode = st.sidebar.radio("功能模式", ["📡 全市场扫描 (Scanner)", "📈 单标的深度分析 (Deep Dive)", "🛡️ 鲁棒性测试 (Robustness)"])
-
-if mode == "📡 全市场扫描 (Scanner)":
-    st.header("🔍 HMM 智能选股器 (Smart Scanner)")
-    st.info("原理：对板块内所有股票进行实时 HMM 建模，寻找处于 **'Regime 0 (低波吸筹)'** 且 **'贝叶斯预期收益 > 0'** 的标的。")
-    
-    selected_sector = st.selectbox("选择扫描赛道", list(SECTORS.keys()))
-    
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        if st.button("🚀 开始扫描", type="primary"):
-            with st.spinner(f"正在扫描 {selected_sector} 核心资产..."):
-                scan_df = run_scanner(
-                    SECTORS[selected_sector], 
-                    datetime.now() - timedelta(days=365*2), 
-                    datetime.now()
-                )
+def run_scanner(sector_list, strategy_cls):
+    """通用扫描器"""
+    results = []
+    progress_bar = st.progress(0)
+    for i, ticker in enumerate(sector_list):
+        try:
+            df = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            if len(df) > 100:
+                strat = strategy_cls()
+                df = strat.generate_signals(df)
+                last = df.iloc[-1]
                 
-                if not scan_df.empty:
-                    # 排序：优先展示买入建议，其次按预期收益排序
-                    scan_df = scan_df.sort_values(by="Raw_Alpha", ascending=False)
-                    
-                    # 样式优化
-                    st.success(f"扫描完成！共分析 {len(scan_df)} 只个股。")
-                    
-                    # 高亮展示 Top 3
-                    top_picks = scan_df.head(3)
-                    st.subheader("🏆 今日首选 (Top Picks)")
-                    cols = st.columns(3)
-                    for i, row in enumerate(top_picks.to_dict('records')):
-                        with cols[i]:
-                            st.metric(
-                                label=f"{row['名称']} ({row['HMM状态']})",
-                                value=row['当前价格'],
-                                delta=f"Alpha: {row['预期Alpha (bps)']} bps"
-                            )
-                    
-                    st.subheader("📋 完整榜单")
-                    # 展示表格 (隐藏 Raw_Alpha)
-                    st.dataframe(
-                        scan_df.drop(columns=['Raw_Alpha', 'RegimeID']),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                # 评分
+                score = last.get('Bayes_Exp_Ret', 0) * 10000
+                if 'MACD_Hist' in df.columns: score += last['MACD_Hist'] * 100 # MACD加分
+                
+                results.append({
+                    "代码": ticker,
+                    "最新价": last['Close'],
+                    "HMM状态": int(last['Regime']),
+                    "信号": "🟢 买入" if last['Signal']==1 else "⚪ 观望",
+                    "Score": score
+                })
+        except: pass
+        progress_bar.progress((i+1)/len(sector_list))
+    return pd.DataFrame(results)
+
+# ==========================================
+# PART 4: Streamlit 主程序
+# ==========================================
+
+st.title("🇨🇳 A-Share Quant Pro: AI 智能投顾")
+
+# 侧边栏
+mode = st.sidebar.radio("系统模式", ["📈 个股深度分析 (Deep Dive)", "📡 板块雷达扫描 (Scanner)"])
+st.sidebar.markdown("---")
+strategy_name = st.sidebar.selectbox("策略内核", ["HMM 自适应贝叶斯 (推荐)", "HMM + MACD 共振", "HMM 经典标准版"])
+
+# 策略映射
+STRAT_MAP = {
+    "HMM 自适应贝叶斯 (推荐)": HMMAdaptiveAshare,
+    "HMM + MACD 共振": HMM_MACD_Ashare,
+    "HMM 经典标准版": HMMStandardAshare
+}
+CurrentStrategy = STRAT_MAP[strategy_name]
+
+if mode == "📈 个股深度分析 (Deep Dive)":
+    ticker_in = st.sidebar.text_input("A股代码 (如 600519)", value="600519")
+    # 自动后缀
+    full_ticker = ticker_in + (".SS" if ticker_in.startswith("6") else ".SZ") if "." not in ticker_in else ticker_in
+    
+    if st.sidebar.button("启动 AI 分析", type="primary"):
+        with st.spinner(f"AI 正在分析 {full_ticker} 的量化特征..."):
+            df = yf.download(full_ticker, period="3y", progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            
+            if not df.empty:
+                # 1. 运行策略
+                strat = CurrentStrategy()
+                df_res = strat.generate_signals(df)
+                
+                # 2. 运行回测
+                engine = AshareBacktestEngine()
+                df_bt = engine.run(df_res)
+                metrics = engine.calculate_metrics(df_bt)
+                
+                # 3. 生成 AI 建议 (核心功能)
+                advice = AI_Investment_Advisor.analyze(df_res, metrics, df_res['Strategy_Type'].iloc[-1])
+                
+                # --- UI 展示 ---
+                
+                # A. AI 建议卡片
+                st.markdown(f"""
+                <div style="background:{advice['bg_color']}; padding:20px; border-radius:12px; border-left:6px solid {advice['action_color']}; margin-bottom:20px;">
+                    <h2 style="color:{advice['action_color']}; margin:0;">{advice['action_title']}</h2>
+                    <p style="color:#EEE; font-size:1.1em; margin-top:10px;">{advice['summary']}</p>
+                    <hr style="border-color:rgba(255,255,255,0.1);">
+                    <p style="color:#AAA; font-size:0.9em;">⚠️ <strong>风控提示</strong>: {advice['risk_warning']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # B. 核心指标
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("策略总回报", f"{metrics['Total Return']*100:.1f}%")
+                k2.metric("夏普比率", f"{metrics['Sharpe']:.2f}")
+                k3.metric("最大回撤", f"{metrics['Max Drawdown']*100:.1f}%")
+                k4.metric("当前 Alpha (bps)", f"{df_res['Bayes_Exp_Ret'].iloc[-1]*10000:.1f}")
+                
+                # C. 图表
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.6, 0.4])
+                
+                # K线 & 状态
+                colors = ['#00E676', '#FFD600', '#FF1744'] # 绿(0), 黄(1), 红(2)
+                for i in range(3):
+                    mask = df_res['Regime'] == i
+                    fig.add_trace(go.Scatter(x=df_res.index[mask], y=df_res['Close'][mask], mode='markers', marker=dict(color=colors[i], size=3), name=f"Regime {i}"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Close'], line=dict(color='gray', width=1), opacity=0.5, showlegend=False), row=1, col=1)
+                
+                # 净值
+                fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Equity_Curve'], name="策略净值", line=dict(color='#2962FF', width=2)), row=2, col=1)
+                fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Benchmark_Curve'], name="基准", line=dict(color='gray', dash='dot')), row=2, col=1)
+                
+                fig.update_layout(template="plotly_dark", height=600, margin=dict(t=30, b=30))
+                st.plotly_chart(fig, use_container_width=True)
+                
+            else:
+                st.error("数据获取失败，请检查代码。")
+
+elif mode == "📡 板块雷达扫描 (Scanner)":
+    sec_name = st.selectbox("选择赛道", list(SECTORS.keys()))
+    if st.button("开始雷达扫描", type="primary"):
+        with st.spinner(f"正在用 {strategy_name} 扫描 {sec_name}..."):
+            res_df = run_scanner(SECTORS[sec_name], CurrentStrategy)
+            
+            if not res_df.empty:
+                res_df = res_df.sort_values(by="Score", ascending=False)
+                
+                # 推荐展示
+                top_buys = res_df[res_df['信号'].str.contains("买入")]
+                if not top_buys.empty:
+                    st.success(f"🎯 发现 {len(top_buys)} 只买入信号标的！")
+                    st.dataframe(top_buys, use_container_width=True, hide_index=True)
                 else:
-                    st.warning("数据获取失败，请检查网络或稍后重试。")
-
-elif mode == "📈 单标的深度分析 (Deep Dive)":
-    st.sidebar.markdown("---")
-    # 允许用户输入自定义代码
-    ticker_input = st.sidebar.text_input("输入 A 股代码 (例如 600519)", value="600519")
-    
-    # 自动补全后缀逻辑
-    if not (ticker_input.endswith(".SS") or ticker_input.endswith(".SZ")):
-        if ticker_input.startswith("6"): ticker_input += ".SS"
-        else: ticker_input += ".SZ"
-    
-    st.header(f"📊 深度分析: {ticker_input}")
-    
-    if st.sidebar.button("运行分析"):
-        start_d = datetime.now() - timedelta(days=365*3)
-        end_d = datetime.now()
-        
-        df = yf.download(ticker_input, start=start_d, end=end_d, progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        
-        if not df.empty:
-            strat = HMMAdaptiveAshare()
-            df_res = strat.generate_signals(df)
-            
-            # 展示最新信号
-            last = df_res.iloc[-1]
-            col1, col2, col3 = st.columns(3)
-            col1.metric("当前状态 (Regime)", f"{int(last['Regime'])}")
-            col2.metric("贝叶斯预期收益", f"{last['Bayes_Exp_Ret']*100:.4f}%")
-            col3.metric("建议仓位", "🟢 满仓" if last['Signal']==1 else "⚪ 空仓")
-            
-            # 回测
-            engine = AshareBacktestEngine()
-            df_bt = engine.run(df_res)
-            
-            # 绘制图表
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-            
-            # K线与Regime颜色
-            colors = ['green', 'orange', 'red'] # 0:绿(吸筹), 1:黄(震荡), 2:红(风险)
-            for i in range(3):
-                mask = df_res['Regime'] == i
-                fig.add_trace(go.Scatter(
-                    x=df_res.index[mask], y=df_res['Close'][mask],
-                    mode='markers', marker=dict(color=colors[i], size=3),
-                    name=f"Regime {i}"
-                ), row=1, col=1)
-            
-            # --- 修复部分 ---
-            # 原错误代码: line=dict(..., opacity=0.5) 导致 opacity 传入了 dict
-            # 修复后: opacity 作为 go.Scatter 的一级参数
-            fig.add_trace(go.Scatter(
-                x=df_res.index, 
-                y=df_res['Close'], 
-                line=dict(color='gray', width=1), 
-                opacity=0.5, # 移到了这里
-                showlegend=False
-            ), row=1, col=1)
-            
-            # 资金曲线
-            fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Equity_Curve'], name="策略净值", line=dict(color='red', width=2)), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Benchmark_Curve'], name="基准净值", line=dict(color='gray', dash='dot')), row=2, col=1)
-            
-            fig.update_layout(template="plotly_dark", height=600, title="价格体制识别与回测净值")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.error("未找到该股票数据，请检查代码。")
-
-elif mode == "🛡️ 鲁棒性测试 (Robustness)":
-    st.header("🛡️ A股策略参数高原测试")
-    st.info("测试 HMM 自适应策略在 A 股不同参数下的稳健性。")
-    
-    ticker_rob = st.sidebar.text_input("测试标的", value="600519.SS")
-    
-    if st.sidebar.button("启动压力测试"):
-        df = yf.download(ticker_rob, start=datetime.now()-timedelta(days=365*3), end=datetime.now(), progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        
-        if not df.empty:
-            # 定义扫描参数
-            windows = range(15, 60, 5) # 波动率窗口
-            thresholds = [0.0002, 0.0003, 0.0004, 0.0005, 0.0006] # 开仓阈值
-            
-            # 调用 robustness.py 中的工具
-            res_df, fig = RobustnessLab.run_sweep(
-                df,
-                HMMAdaptiveAshare, # 传入适配了A股的策略类
-                AshareBacktestEngine, # 传入适配了A股的回测引擎
-                windows,
-                thresholds,
-                progress_callback=st.progress(0).progress
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            avg, cv, assess = RobustnessLab.check_stability(res_df)
-            st.markdown(assess)
-        else:
-            st.error("数据获取失败。")
+                    st.warning("当前板块无买入信号，建议观望。")
+                
+                with st.expander("查看完整列表"):
+                    st.dataframe(res_df, use_container_width=True)
+            else:
+                st.error("数据获取失败。")
