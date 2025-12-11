@@ -183,7 +183,7 @@ class HMM_MACD_Ashare(StrategyBase):
         return df
 
 # ==========================================
-# PART 2: AI 智能投顾模块 (核心新增)
+# PART 2: AI 智能投顾模块 (强化版)
 # ==========================================
 
 class AI_Investment_Advisor:
@@ -193,49 +193,72 @@ class AI_Investment_Advisor:
     @staticmethod
     def analyze(df, metrics, strategy_type):
         last = df.iloc[-1]
+        # 获取前一天的信号，用于判断突变
+        prev = df.iloc[-2] if len(df) > 1 else last
+        
         regime = int(last['Regime'])
         signal = int(last['Signal'])
+        prev_signal = int(prev['Signal'])
         alpha = last.get('Bayes_Exp_Ret', 0)
         
-        # 1. 市场状态画像
+        # 1. 判断信号突变 (Signal Flip)
+        signal_change = "None"
+        if signal == 1 and prev_signal == 0:
+            signal_change = "BUY_NEW" # 新增买点
+        elif signal == 0 and prev_signal == 1:
+            signal_change = "SELL_EXIT" # 新增卖点
+        
+        # 2. 市场状态画像
         regime_desc = {
-            0: "🌱 底部/吸筹 (Low Volatility)",
-            1: "🌊 趋势/中继 (Medium Volatility)", 
-            2: "🌪️ 顶部/风险 (High Volatility)"
+            0: "🌱 底部/吸筹 (Low Vol)",
+            1: "🌊 趋势/中继 (Med Vol)", 
+            2: "🌪️ 顶部/风险 (High Vol)"
         }
         market_status = regime_desc.get(regime, "未知状态")
         
-        # 2. 策略逻辑解释
+        # 3. 策略逻辑解释
         logic_expl = ""
         if strategy_type == 'Standard':
-            logic_expl = "经典轮动逻辑：当前处于" + ("低波稳态，符合买入条件。" if regime==0 else "高波/震荡态，建议空仓防御。")
+            logic_expl = f"HMM 处于 {market_status}。"
         elif strategy_type == 'Adaptive':
-            logic_expl = f"贝叶斯概率逻辑：模型预测次日具有 {'正向' if alpha>0 else '负向'} 预期收益 (Alpha={alpha*100:.3f}%)，" + ("资金做多意愿强。" if signal==1 else "风险溢价不足，建议观望。")
+            logic_expl = f"贝叶斯 Alpha={alpha*100:.3f}% ({'积极' if alpha>0 else '消极'})。"
         elif strategy_type == 'MACD_Resonance':
             macd_val = last.get('MACD_Hist', 0)
-            logic_expl = f"趋势共振逻辑：HMM 宏观判断{'看多' if last.get('HMM_Signal',0)==1 else '看空'}，叠加 MACD 技术面{'金叉(红柱)' if macd_val>0 else '死叉(绿柱)'}。" + ("双重验证通过，强烈看多。" if signal==1 else "共振失败，保持防守。")
+            logic_expl = f"HMM {'看多' if last.get('HMM_Signal',0)==1 else '看空'} + MACD {'金叉' if macd_val>0 else '死叉'}。"
 
-        # 3. 最终行动建议
+        # 4. 最终行动建议 (结合突变判断)
         advice_card = {
             "action_title": "",
             "action_color": "",
             "bg_color": "",
             "summary": "",
-            "risk_warning": ""
+            "risk_warning": "",
+            "signal_change": signal_change # 传递突变状态
         }
         
         if signal == 1:
-            advice_card['action_title'] = "🚀 强力买入 / 持股 (LONG)"
+            if signal_change == "BUY_NEW":
+                advice_card['action_title'] = "🔔 信号突变：买入建仓 (BUY ALERT)"
+                advice_card['summary'] = f"**{market_status}**。今日策略信号由空转多！{logic_expl} 建议把握建仓时机。"
+            else:
+                advice_card['action_title'] = "🚀 强力持股 (HOLD)"
+                advice_card['summary'] = f"**{market_status}**。多头趋势延续中。{logic_expl} 建议坚定持有。"
+            
             advice_card['action_color'] = "#00E676" # Green
             advice_card['bg_color'] = "rgba(0, 230, 118, 0.1)"
-            advice_card['summary'] = f"**{market_status}**。{logic_expl} 量化信号积极，建议建立多头仓位。"
-            advice_card['risk_warning'] = "止损建议：若收盘价跌破20日均线，或HMM状态跳变为State 2，立即离场。"
+            advice_card['risk_warning'] = "止损建议：若跌破20日均线或HMM跳变至State 2，立即离场。"
+            
         else:
-            advice_card['action_title'] = "🛡️ 空仓观望 / 卖出 (CASH)"
+            if signal_change == "SELL_EXIT":
+                advice_card['action_title'] = "🔔 信号突变：离场警报 (EXIT ALERT)"
+                advice_card['summary'] = f"**{market_status}**。今日策略信号由多转空！{logic_expl} 风险显著增加，建议立即卖出。"
+            else:
+                advice_card['action_title'] = "🛡️ 空仓观望 (WAIT)"
+                advice_card['summary'] = f"**{market_status}**。当前无操作机会。{logic_expl} 建议持有现金，等待新信号。"
+                
             advice_card['action_color'] = "#FF5252" # Red
             advice_card['bg_color'] = "rgba(255, 82, 82, 0.1)"
-            advice_card['summary'] = f"**{market_status}**。{logic_expl} 量化信号转弱或风险过高，建议持有现金。"
-            advice_card['risk_warning'] = "观察建议：等待HMM状态回归State 0，或预期Alpha转正后再行介入。"
+            advice_card['risk_warning'] = "观察建议：耐心等待 HMM 状态回归 State 0。"
             
         return advice_card
 
@@ -280,16 +303,23 @@ def run_scanner(sector_list, strategy_cls):
                 strat = strategy_cls()
                 df = strat.generate_signals(df)
                 last = df.iloc[-1]
+                prev = df.iloc[-2]
+                
+                # 信号突变检测
+                change = "不变"
+                if last['Signal']==1 and prev['Signal']==0: change = "🚀 新买点"
+                elif last['Signal']==0 and prev['Signal']==1: change = "🔻 离场"
                 
                 # 评分
                 score = last.get('Bayes_Exp_Ret', 0) * 10000
-                if 'MACD_Hist' in df.columns: score += last['MACD_Hist'] * 100 # MACD加分
+                if 'MACD_Hist' in df.columns: score += last['MACD_Hist'] * 100 
                 
                 results.append({
                     "代码": ticker,
                     "最新价": last['Close'],
                     "HMM状态": int(last['Regime']),
-                    "信号": "🟢 买入" if last['Signal']==1 else "⚪ 观望",
+                    "当前信号": "🟢 持股" if last['Signal']==1 else "⚪ 空仓",
+                    "异动提醒": change,
                     "Score": score
                 })
         except: pass
@@ -317,7 +347,6 @@ CurrentStrategy = STRAT_MAP[strategy_name]
 
 if mode == "📈 个股深度分析 (Deep Dive)":
     ticker_in = st.sidebar.text_input("A股代码 (如 600519)", value="600519")
-    # 自动后缀
     full_ticker = ticker_in + (".SS" if ticker_in.startswith("6") else ".SZ") if "." not in ticker_in else ticker_in
     
     if st.sidebar.button("启动 AI 分析", type="primary"):
@@ -335,12 +364,18 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                 df_bt = engine.run(df_res)
                 metrics = engine.calculate_metrics(df_bt)
                 
-                # 3. 生成 AI 建议 (核心功能)
+                # 3. 生成 AI 建议
                 advice = AI_Investment_Advisor.analyze(df_res, metrics, df_res['Strategy_Type'].iloc[-1])
                 
                 # --- UI 展示 ---
                 
-                # A. AI 建议卡片
+                # A. 信号突变横幅 (Alert Banner)
+                if advice['signal_change'] == "BUY_NEW":
+                    st.success("🚨 **ALERT: DETECTED NEW BUY SIGNAL TODAY (今日触发买入信号)**")
+                elif advice['signal_change'] == "SELL_EXIT":
+                    st.error("🚨 **ALERT: DETECTED EXIT SIGNAL TODAY (今日触发卖出信号)**")
+
+                # B. AI 建议卡片
                 st.markdown(f"""
                 <div style="background:{advice['bg_color']}; padding:20px; border-radius:12px; border-left:6px solid {advice['action_color']}; margin-bottom:20px;">
                     <h2 style="color:{advice['action_color']}; margin:0;">{advice['action_title']}</h2>
@@ -350,23 +385,43 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # B. 核心指标
+                # C. 核心指标
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("策略总回报", f"{metrics['Total Return']*100:.1f}%")
                 k2.metric("夏普比率", f"{metrics['Sharpe']:.2f}")
                 k3.metric("最大回撤", f"{metrics['Max Drawdown']*100:.1f}%")
                 k4.metric("当前 Alpha (bps)", f"{df_res['Bayes_Exp_Ret'].iloc[-1]*10000:.1f}")
                 
-                # C. 图表
+                # D. 图表 (增加买卖点标记)
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.6, 0.4])
                 
-                # K线 & 状态
-                colors = ['#00E676', '#FFD600', '#FF1744'] # 绿(0), 黄(1), 红(2)
+                # K线 & 状态背景点
+                colors = ['#00E676', '#FFD600', '#FF1744'] 
                 for i in range(3):
                     mask = df_res['Regime'] == i
                     fig.add_trace(go.Scatter(x=df_res.index[mask], y=df_res['Close'][mask], mode='markers', marker=dict(color=colors[i], size=3), name=f"Regime {i}"), row=1, col=1)
                 fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Close'], line=dict(color='gray', width=1), opacity=0.5, showlegend=False), row=1, col=1)
                 
+                # *** 新增：明确的买卖点箭头 ***
+                # 计算信号变化点: 0->1 (Buy), 1->0 (Sell)
+                df_res['Signal_Diff'] = df_res['Signal'].diff()
+                buy_points = df_res[df_res['Signal_Diff'] == 1]
+                sell_points = df_res[df_res['Signal_Diff'] == -1]
+                
+                if not buy_points.empty:
+                    fig.add_trace(go.Scatter(
+                        x=buy_points.index, y=buy_points['Close']*0.98, # 稍微在K线下放一点
+                        mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00E676'),
+                        name='明确买点 (Buy Action)'
+                    ), row=1, col=1)
+                    
+                if not sell_points.empty:
+                    fig.add_trace(go.Scatter(
+                        x=sell_points.index, y=sell_points['Close']*1.02, # 稍微在K线上放一点
+                        mode='markers', marker=dict(symbol='triangle-down', size=12, color='#FF5252'),
+                        name='明确卖点 (Sell Action)'
+                    ), row=1, col=1)
+
                 # 净值
                 fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Equity_Curve'], name="策略净值", line=dict(color='#2962FF', width=2)), row=2, col=1)
                 fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Benchmark_Curve'], name="基准", line=dict(color='gray', dash='dot')), row=2, col=1)
@@ -386,15 +441,22 @@ elif mode == "📡 板块雷达扫描 (Scanner)":
             if not res_df.empty:
                 res_df = res_df.sort_values(by="Score", ascending=False)
                 
-                # 推荐展示
-                top_buys = res_df[res_df['信号'].str.contains("买入")]
-                if not top_buys.empty:
-                    st.success(f"🎯 发现 {len(top_buys)} 只买入信号标的！")
-                    st.dataframe(top_buys, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("当前板块无买入信号，建议观望。")
+                # 推荐展示 (异动优先)
+                new_actions = res_df[res_df['异动提醒'].isin(["🚀 新买点", "🔻 离场"])]
+                if not new_actions.empty:
+                    st.info(f"⚡ **今日异动 (Signal Change Today):** {len(new_actions)} 只标的触发信号突变！")
+                    st.dataframe(new_actions, use_container_width=True, hide_index=True)
                 
-                with st.expander("查看完整列表"):
+                # 现有持仓推荐
+                top_buys = res_df[res_df['当前信号'].str.contains("持股")]
+                if not top_buys.empty:
+                    st.success(f"🎯 **持股池 (Holding):** {len(top_buys)} 只标的建议继续持有")
+                    with st.expander("查看持股列表"):
+                        st.dataframe(top_buys, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("当前板块无持股建议，建议观望。")
+                
+                with st.expander("查看完整扫描结果"):
                     st.dataframe(res_df, use_container_width=True)
             else:
                 st.error("数据获取失败。")
