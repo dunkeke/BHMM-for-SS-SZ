@@ -387,6 +387,17 @@ class AI_Investment_Advisor:
             
         return advice_card
 
+def detect_regime_buy_trigger(df):
+    """
+    检测是否出现 Regime Change 买点：
+    昨日非低波状态(!=0)，今日切换到低波状态(==0)，且信号为买入(1)。
+    """
+    if len(df) < 2 or 'Regime' not in df.columns or 'Signal' not in df.columns:
+        return False
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    return int(prev['Regime']) != 0 and int(last['Regime']) == 0 and int(last['Signal']) == 1
+
 # ==========================================
 # PART 3: 扫描与回测引擎
 # ==========================================
@@ -429,11 +440,13 @@ def run_scanner(sector_list, strategy_cls):
                 df = strat.generate_signals(df)
                 last = df.iloc[-1]
                 prev = df.iloc[-2]
+                regime_buy_trigger = detect_regime_buy_trigger(df)
                 
                 # 信号突变检测
                 change = "不变"
                 if last['Signal']==1 and prev['Signal']==0: change = "🚀 新买点"
                 elif last['Signal']==0 and prev['Signal']==1: change = "🔻 离场"
+                elif regime_buy_trigger: change = "🔔 Regime切换买点"
                 
                 # 评分
                 score = last.get('Bayes_Exp_Ret', 0) * 10000
@@ -445,6 +458,7 @@ def run_scanner(sector_list, strategy_cls):
                     "HMM状态": int(last['Regime']),
                     "当前信号": "🟢 持股" if last['Signal']==1 else "⚪ 空仓",
                     "异动提醒": change,
+                    "Regime买点": "✅ 触发" if regime_buy_trigger else "—",
                     "Score": score
                 })
         except: pass
@@ -499,6 +513,12 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                     st.success("🚨 **ALERT: DETECTED NEW BUY SIGNAL TODAY (今日触发买入信号)**")
                 elif advice['signal_change'] == "SELL_EXIT":
                     st.error("🚨 **ALERT: DETECTED EXIT SIGNAL TODAY (今日触发卖出信号)**")
+
+                # A2. Regime Change 买点提示
+                regime_buy_trigger = detect_regime_buy_trigger(df_res)
+                if regime_buy_trigger:
+                    st.toast("🔔 Regime Change 买点触发：状态切换到低波区，建议考虑买入。", icon="🚀")
+                    st.info("📌 **Regime Change 买点提示**：昨日非低波，今日切换到低波状态且策略信号为买入。")
 
                 # B. AI 建议卡片
                 st.markdown(f"""
@@ -568,9 +588,14 @@ elif mode == "📡 板块雷达扫描 (Scanner)":
                 
                 # 推荐展示 (异动优先)
                 new_actions = res_df[res_df['异动提醒'].isin(["🚀 新买点", "🔻 离场"])]
+                regime_actions = res_df[res_df['Regime买点'] == "✅ 触发"]
                 if not new_actions.empty:
                     st.info(f"⚡ **今日异动 (Signal Change Today):** {len(new_actions)} 只标的触发信号突变！")
                     st.dataframe(new_actions, use_container_width=True, hide_index=True)
+                if not regime_actions.empty:
+                    st.success(f"🔔 **Regime Change 买点:** {len(regime_actions)} 只标的满足状态切换买点条件。")
+                    with st.expander("查看 Regime 买点列表"):
+                        st.dataframe(regime_actions, use_container_width=True, hide_index=True)
                 
                 # 现有持仓推荐
                 top_buys = res_df[res_df['当前信号'].str.contains("持股")]
