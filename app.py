@@ -2,6 +2,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import akshare as ak
 from hmmlearn.hmm import GaussianHMM
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -15,6 +16,42 @@ except ImportError:
     pass # 鲁棒性模块为可选
 
 warnings.filterwarnings("ignore")
+
+def fetch_stock_data(ticker, period="3y"):
+    """获取股票数据（yfinance）"""
+    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+def fetch_convertible_bond_data(symbol, period="3y"):
+    """
+    获取可转债日线数据（akshare）。
+    symbol 示例：113519（长汽转债）
+    """
+    df = ak.bond_zh_hs_cov_daily(symbol=symbol)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date')
+    elif not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+
+    rename_map = {'close': 'Close', 'open': 'Open', 'high': 'High', 'low': 'Low', 'volume': 'Volume'}
+    for old_col, new_col in rename_map.items():
+        if old_col in df.columns:
+            df.rename(columns={old_col: new_col}, inplace=True)
+
+    required_cols = ['Open', 'High', 'Low', 'Close']
+    if any(c not in df.columns for c in required_cols):
+        return pd.DataFrame()
+
+    if period.endswith("y"):
+        years = int(period[:-1])
+        cutoff = pd.Timestamp.today() - pd.DateOffset(years=years)
+        df = df[df.index >= cutoff]
+    return df.sort_index()
 
 # ==========================================
 # 0. 全局配置
@@ -151,6 +188,22 @@ SECTORS = {
         "002600.SZ",  # 领益智造 - 精密功能件
         "300433.SZ",  # 蓝思科技 - 消费电子外观 (重复项保留，作为权重)
         "002384.SZ"   # 东山精密 - FPC和PCB
+    ]
+}
+
+# 可转债观察池 (用于扫描)
+CONVERTIBLE_BONDS = {
+    "热门可转债": [
+        "113519",  # 长汽转债
+        "113563",  # 柳药转债
+        "113605",  # 大参转债
+        "110059",  # 浦发转债
+        "110081",  # 闻泰转债
+        "127027",  # 能化转债
+        "127038",  # 国微转债
+        "128136",  # 立讯转债
+        "123107",  # 温氏转债
+        "123117"   # 健帆转债
     ]
 }
 
@@ -427,14 +480,13 @@ class AshareBacktestEngine:
         dd = (df['Equity_Curve']/df['Equity_Curve'].cummax()-1).min()
         return {"Total Return": total_ret, "CAGR": ann_ret, "Sharpe": sharpe, "Max Drawdown": dd}
 
-def run_scanner(sector_list, strategy_cls):
+def run_scanner(sector_list, strategy_cls, data_fetcher, period="2y"):
     """通用扫描器"""
     results = []
     progress_bar = st.progress(0)
     for i, ticker in enumerate(sector_list):
         try:
-            df = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            df = data_fetcher(ticker, period=period)
             if len(df) > 100:
                 strat = strategy_cls()
                 df = strat.generate_signals(df)
@@ -474,6 +526,7 @@ st.title("🇨🇳 A-Share Quant Pro: AI 智能投顾")
 # 侧边栏
 mode = st.sidebar.radio("系统模式", ["📈 个股深度分析 (Deep Dive)", "📡 板块雷达扫描 (Scanner)"])
 st.sidebar.markdown("---")
+asset_type = st.sidebar.radio("分析标的", ["A股股票", "可转债"])
 strategy_name = st.sidebar.selectbox("策略内核", ["HMM 自适应贝叶斯 (推荐)", "HMM + MACD 共振", "HMM 经典标准版"])
 
 # 策略映射
@@ -485,13 +538,18 @@ STRAT_MAP = {
 CurrentStrategy = STRAT_MAP[strategy_name]
 
 if mode == "📈 个股深度分析 (Deep Dive)":
-    ticker_in = st.sidebar.text_input("A股代码 (如 600519)", value="600519")
-    full_ticker = ticker_in + (".SS" if ticker_in.startswith("6") else ".SZ") if "." not in ticker_in else ticker_in
+    if asset_type == "A股股票":
+        ticker_in = st.sidebar.text_input("A股代码 (如 600519)", value="600519")
+        full_ticker = ticker_in + (".SS" if ticker_in.startswith("6") else ".SZ") if "." not in ticker_in else ticker_in
+        fetcher = fetch_stock_data
+    else:
+        ticker_in = st.sidebar.text_input("可转债代码 (如 113519)", value="113519")
+        full_ticker = ticker_in
+        fetcher = fetch_convertible_bond_data
     
     if st.sidebar.button("启动 AI 分析", type="primary"):
         with st.spinner(f"AI 正在分析 {full_ticker} 的量化特征..."):
-            df = yf.download(full_ticker, period="3y", progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            df = fetcher(full_ticker, period="3y")
             
             if not df.empty:
                 # 1. 运行策略
@@ -578,10 +636,18 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                 st.error("数据获取失败，请检查代码。")
 
 elif mode == "📡 板块雷达扫描 (Scanner)":
-    sec_name = st.selectbox("选择赛道", list(SECTORS.keys()))
+    if asset_type == "A股股票":
+        sec_name = st.selectbox("选择赛道", list(SECTORS.keys()))
+        current_pool = SECTORS[sec_name]
+        scanner_fetcher = fetch_stock_data
+    else:
+        sec_name = st.selectbox("选择可转债池", list(CONVERTIBLE_BONDS.keys()))
+        current_pool = CONVERTIBLE_BONDS[sec_name]
+        scanner_fetcher = fetch_convertible_bond_data
+
     if st.button("开始雷达扫描", type="primary"):
         with st.spinner(f"正在用 {strategy_name} 扫描 {sec_name}..."):
-            res_df = run_scanner(SECTORS[sec_name], CurrentStrategy)
+            res_df = run_scanner(current_pool, CurrentStrategy, scanner_fetcher, period="2y")
             
             if not res_df.empty:
                 res_df = res_df.sort_values(by="Score", ascending=False)
