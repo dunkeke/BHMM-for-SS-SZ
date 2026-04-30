@@ -8,6 +8,11 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import warnings
 
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
+
 # 尝试引入鲁棒性模块
 try:
     from robustness import RobustnessLab
@@ -427,10 +432,133 @@ class AshareBacktestEngine:
         dd = (df['Equity_Curve']/df['Equity_Curve'].cummax()-1).min()
         return {"Total Return": total_ret, "CAGR": ann_ret, "Sharpe": sharpe, "Max Drawdown": dd}
 
-def run_scanner(sector_list, strategy_cls):
-    """通用扫描器"""
+
+
+def get_market_universe(scope_name):
+    """获取A股可扫描股票池（主板/创业板）。需要 akshare 支持。"""
+    if ak is None:
+        raise RuntimeError("未安装 akshare，无法进行全市场扫描。请先 `pip install akshare`。")
+
+    code_df = ak.stock_info_a_code_name()
+    if code_df is None or code_df.empty or 'code' not in code_df.columns:
+        raise RuntimeError("股票列表获取失败，请稍后重试。")
+
+    codes = code_df['code'].astype(str).str.zfill(6)
+
+    sh_main = codes.str.startswith(("600", "601", "603", "605"))
+    sz_main = codes.str.startswith(("000", "001", "002"))
+    cyb = codes.str.startswith(("300", "301"))
+
+    if scope_name == "全市场 (主板+创业板)":
+        picked = code_df[sh_main | sz_main | cyb]['code']
+    elif scope_name == "主板 (沪深)":
+        picked = code_df[sh_main | sz_main]['code']
+    elif scope_name == "创业板":
+        picked = code_df[cyb]['code']
+    else:
+        raise ValueError(f"未知扫描范围: {scope_name}")
+
+    def to_ticker(code):
+        code = str(code).zfill(6)
+        return f"{code}.SS" if code.startswith('6') else f"{code}.SZ"
+
+    tickers = [to_ticker(c) for c in picked.tolist()]
+    # 去重并保持顺序
+    return list(dict.fromkeys(tickers))
+
+
+
+def get_convertible_universe():
+    """获取A股可转债列表。"""
+    if ak is None:
+        raise RuntimeError("未安装 akshare，无法获取可转债列表。")
+    spot = ak.bond_zh_hs_cov_spot()
+    if spot is None or spot.empty or 'symbol' not in spot.columns:
+        raise RuntimeError("可转债列表获取失败，请稍后重试。")
+    symbols = spot['symbol'].astype(str).str.zfill(6).tolist()
+    return list(dict.fromkeys(symbols))
+
+
+def download_convertible_history(symbol, period="2y"):
+    """下载可转债日线并映射为策略所需字段。"""
+    if ak is None:
+        return pd.DataFrame()
+    try:
+        df = ak.bond_zh_hs_cov_daily(symbol=symbol)
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    data = df.copy()
+    if 'date' in data.columns:
+        data['date'] = pd.to_datetime(data['date'])
+        data = data.set_index('date')
+    elif '日期' in data.columns:
+        data['日期'] = pd.to_datetime(data['日期'])
+        data = data.set_index('日期')
+
+    rename_map = {
+        'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume',
+        '开盘': 'Open', '最高': 'High', '最低': 'Low', '收盘': 'Close', '成交量': 'Volume'
+    }
+    data = data.rename(columns=rename_map)
+    needed = ['Open', 'High', 'Low', 'Close', 'Volume']
+    for col in needed:
+        if col not in data.columns:
+            data[col] = np.nan if col != 'Volume' else 0
+    data = data[needed].dropna(subset=['Close']).sort_index()
+    return data.tail(520 if period == '2y' else len(data))
+
+
+def run_convertible_scanner(symbol_list, strategy_cls, start_idx=0, total_count=None):
+    """可转债扫描器，支持分批增量扫描。"""
     results = []
-    progress_bar = st.progress(0)
+    if total_count is None:
+        total_count = len(symbol_list)
+    progress_bar = st.progress(start_idx / max(total_count, 1))
+    for i, symbol in enumerate(symbol_list):
+        try:
+            df = download_convertible_history(symbol, period="2y")
+            if len(df) > 100:
+                strat = strategy_cls()
+                df = strat.generate_signals(df)
+                last = df.iloc[-1]
+                prev = df.iloc[-2]
+                regime_buy_trigger = detect_regime_buy_trigger(df)
+
+                change = "不变"
+                if last['Signal'] == 1 and prev['Signal'] == 0:
+                    change = "🚀 新买点"
+                elif last['Signal'] == 0 and prev['Signal'] == 1:
+                    change = "🔻 离场"
+                elif regime_buy_trigger:
+                    change = "🔔 Regime切换买点"
+
+                score = last.get('Bayes_Exp_Ret', 0) * 10000
+                if 'MACD_Hist' in df.columns:
+                    score += last['MACD_Hist'] * 100
+
+                results.append({
+                    "代码": symbol,
+                    "最新价": last['Close'],
+                    "HMM状态": int(last['Regime']),
+                    "当前信号": "🟢 持股" if last['Signal'] == 1 else "⚪ 空仓",
+                    "异动提醒": change,
+                    "Regime买点": "✅ 触发" if regime_buy_trigger else "—",
+                    "Score": score
+                })
+        except Exception:
+            pass
+        progress_bar.progress((start_idx + i + 1) / max(total_count, 1))
+    return pd.DataFrame(results)
+
+def run_scanner(sector_list, strategy_cls, start_idx=0, total_count=None):
+    """通用扫描器，支持分批增量扫描。"""
+    results = []
+    if total_count is None:
+        total_count = len(sector_list)
+    progress_bar = st.progress(start_idx / max(total_count, 1))
     for i, ticker in enumerate(sector_list):
         try:
             df = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
@@ -462,7 +590,7 @@ def run_scanner(sector_list, strategy_cls):
                     "Score": score
                 })
         except: pass
-        progress_bar.progress((i+1)/len(sector_list))
+        progress_bar.progress((start_idx + i + 1)/max(total_count, 1))
     return pd.DataFrame(results)
 
 # ==========================================
@@ -472,7 +600,7 @@ def run_scanner(sector_list, strategy_cls):
 st.title("🇨🇳 A-Share Quant Pro: AI 智能投顾")
 
 # 侧边栏
-mode = st.sidebar.radio("系统模式", ["📈 个股深度分析 (Deep Dive)", "📡 板块雷达扫描 (Scanner)"])
+mode = st.sidebar.radio("系统模式", ["📈 个股深度分析 (Deep Dive)", "📡 板块雷达扫描 (Scanner)", "🔁 可转债雷达扫描 (CB Scanner)"])
 st.sidebar.markdown("---")
 strategy_name = st.sidebar.selectbox("策略内核", ["HMM 自适应贝叶斯 (推荐)", "HMM + MACD 共振", "HMM 经典标准版"])
 
@@ -483,6 +611,15 @@ STRAT_MAP = {
     "HMM 经典标准版": HMMStandardAshare
 }
 CurrentStrategy = STRAT_MAP[strategy_name]
+
+
+if 'scanner_state' not in st.session_state:
+    st.session_state['scanner_state'] = {
+        'offset': 0,
+        'results': pd.DataFrame(),
+        'universe_key': '',
+        'strategy': ''
+    }
 
 if mode == "📈 个股深度分析 (Deep Dive)":
     ticker_in = st.sidebar.text_input("A股代码 (如 600519)", value="600519")
@@ -578,11 +715,72 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                 st.error("数据获取失败，请检查代码。")
 
 elif mode == "📡 板块雷达扫描 (Scanner)":
-    sec_name = st.selectbox("选择赛道", list(SECTORS.keys()))
-    if st.button("开始雷达扫描", type="primary"):
-        with st.spinner(f"正在用 {strategy_name} 扫描 {sec_name}..."):
-            res_df = run_scanner(SECTORS[sec_name], CurrentStrategy)
-            
+    st.subheader("📡 扫描设置")
+    st.caption("新增：可切换到全市场扫描（主板/创业板）。扫描参数位于左侧边栏。")
+    scan_mode = st.sidebar.radio("扫描模式", ["板块扫描", "全市场扫描（主板/创业板）"])
+
+    if scan_mode == "板块扫描":
+        sec_name = st.sidebar.selectbox("选择赛道", list(SECTORS.keys()))
+        universe = SECTORS[sec_name]
+        scan_label = sec_name
+    else:
+        scope = st.sidebar.selectbox("扫描范围", ["全市场 (主板+创业板)", "主板 (沪深)", "创业板"])
+        batch_size = st.sidebar.slider("单批扫描数量（增量）", min_value=100, max_value=1500, value=400, step=100)
+        try:
+            universe = get_market_universe(scope)
+            scan_label = f"{scope}（{len(universe)}只）"
+        except Exception as e:
+            universe = []
+            st.error(f"全市场股票池加载失败：{e}")
+            scan_label = scope
+
+    universe_key = f"{scan_mode}|{scan_label}"
+    state = st.session_state['scanner_state']
+
+    if state['universe_key'] != universe_key or state['strategy'] != strategy_name:
+        state['offset'] = 0
+        state['results'] = pd.DataFrame()
+        state['universe_key'] = universe_key
+        state['strategy'] = strategy_name
+
+    if scan_mode == "全市场扫描（主板/创业板）":
+        st.sidebar.caption(f"进度：{state['offset']} / {len(universe) if universe else 0}")
+        col_a, col_b = st.sidebar.columns(2)
+        start_scan = col_a.button("开始/继续", type="primary")
+        reset_scan = col_b.button("重置进度")
+        if reset_scan:
+            state['offset'] = 0
+            state['results'] = pd.DataFrame()
+            st.sidebar.success("已重置增量扫描进度")
+
+        do_scan = start_scan
+    else:
+        do_scan = st.sidebar.button("开始雷达扫描", type="primary")
+
+    if do_scan:
+        st.info(f"当前扫描模式：{scan_mode} | 范围：{scan_label}")
+        if not universe:
+            st.warning("当前扫描股票池为空，请先修复数据源后重试。")
+        else:
+            if scan_mode == "全市场扫描（主板/创业板）":
+                start = state['offset']
+                end = min(start + batch_size, len(universe))
+                batch = universe[start:end]
+                with st.spinner(f"正在扫描第 {start+1} ~ {end} 只..."):
+                    res_df = run_scanner(batch, CurrentStrategy, start_idx=start, total_count=len(universe))
+                if not res_df.empty:
+                    state['results'] = pd.concat([state['results'], res_df], ignore_index=True)
+                    state['results'] = state['results'].drop_duplicates(subset=['代码'], keep='last')
+                state['offset'] = end
+                res_df = state['results'].copy()
+                if state['offset'] >= len(universe):
+                    st.success("✅ 全市场已扫描完成，可点击重置重新开始。")
+                else:
+                    st.info(f"已完成 {state['offset']} / {len(universe)}，可继续下一批。")
+            else:
+                with st.spinner(f"正在用 {strategy_name} 扫描 {scan_label}..."):
+                    res_df = run_scanner(universe, CurrentStrategy)
+
             if not res_df.empty:
                 res_df = res_df.sort_values(by="Score", ascending=False)
                 
@@ -610,3 +808,65 @@ elif mode == "📡 板块雷达扫描 (Scanner)":
                     st.dataframe(res_df, use_container_width=True)
             else:
                 st.error("数据获取失败。")
+
+
+elif mode == "🔁 可转债雷达扫描 (CB Scanner)":
+    st.subheader("🔁 可转债雷达扫描")
+    batch_size = st.sidebar.slider("可转债单批扫描数量", min_value=50, max_value=500, value=200, step=50)
+    cb_state_key = 'cb_scanner_state'
+    if cb_state_key not in st.session_state:
+        st.session_state[cb_state_key] = {'offset': 0, 'results': pd.DataFrame(), 'strategy': ''}
+    cb_state = st.session_state[cb_state_key]
+
+    try:
+        cb_universe = get_convertible_universe()
+        st.caption(f"当前可转债池：{len(cb_universe)} 只")
+    except Exception as e:
+        cb_universe = []
+        st.error(f"可转债列表加载失败：{e}")
+
+    if cb_state['strategy'] != strategy_name:
+        cb_state['offset'] = 0
+        cb_state['results'] = pd.DataFrame()
+        cb_state['strategy'] = strategy_name
+
+    st.sidebar.caption(f"可转债进度：{cb_state['offset']} / {len(cb_universe) if cb_universe else 0}")
+    c1, c2 = st.sidebar.columns(2)
+    start_cb = c1.button("开始/继续可转债", type="primary")
+    reset_cb = c2.button("重置可转债")
+
+    if reset_cb:
+        cb_state['offset'] = 0
+        cb_state['results'] = pd.DataFrame()
+        st.sidebar.success("已重置可转债扫描进度")
+
+    if start_cb:
+        if not cb_universe:
+            st.warning("可转债股票池为空，请检查数据源后重试。")
+        else:
+            start = cb_state['offset']
+            end = min(start + batch_size, len(cb_universe))
+            batch = cb_universe[start:end]
+            with st.spinner(f"正在扫描可转债第 {start+1} ~ {end} 只..."):
+                cb_df = run_convertible_scanner(batch, CurrentStrategy, start_idx=start, total_count=len(cb_universe))
+
+            if not cb_df.empty:
+                cb_state['results'] = pd.concat([cb_state['results'], cb_df], ignore_index=True)
+                cb_state['results'] = cb_state['results'].drop_duplicates(subset=['代码'], keep='last')
+            cb_state['offset'] = end
+
+            res_df = cb_state['results'].sort_values(by="Score", ascending=False) if not cb_state['results'].empty else cb_state['results']
+            if cb_state['offset'] >= len(cb_universe):
+                st.success("✅ 可转债全池扫描完成。")
+            else:
+                st.info(f"已完成 {cb_state['offset']} / {len(cb_universe)}，可继续下一批。")
+
+            if not res_df.empty:
+                new_actions = res_df[res_df['异动提醒'].isin(["🚀 新买点", "🔻 离场"])]
+                if not new_actions.empty:
+                    st.info(f"⚡ 今日异动：{len(new_actions)} 只")
+                    st.dataframe(new_actions, use_container_width=True, hide_index=True)
+                with st.expander("查看可转债完整扫描结果"):
+                    st.dataframe(res_df, use_container_width=True, hide_index=True)
+            else:
+                st.warning("当前批次未产出有效结果。")
