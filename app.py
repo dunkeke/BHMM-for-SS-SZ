@@ -8,6 +8,11 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import warnings
 
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
+
 # 尝试引入鲁棒性模块
 try:
     from robustness import RobustnessLab
@@ -427,10 +432,46 @@ class AshareBacktestEngine:
         dd = (df['Equity_Curve']/df['Equity_Curve'].cummax()-1).min()
         return {"Total Return": total_ret, "CAGR": ann_ret, "Sharpe": sharpe, "Max Drawdown": dd}
 
-def run_scanner(sector_list, strategy_cls):
-    """通用扫描器"""
+
+
+def get_market_universe(scope_name):
+    """获取A股可扫描股票池（主板/创业板）。需要 akshare 支持。"""
+    if ak is None:
+        raise RuntimeError("未安装 akshare，无法进行全市场扫描。请先 `pip install akshare`。")
+
+    code_df = ak.stock_info_a_code_name()
+    if code_df is None or code_df.empty or 'code' not in code_df.columns:
+        raise RuntimeError("股票列表获取失败，请稍后重试。")
+
+    codes = code_df['code'].astype(str).str.zfill(6)
+
+    sh_main = codes.str.startswith(("600", "601", "603", "605"))
+    sz_main = codes.str.startswith(("000", "001", "002"))
+    cyb = codes.str.startswith(("300", "301"))
+
+    if scope_name == "全市场 (主板+创业板)":
+        picked = code_df[sh_main | sz_main | cyb]['code']
+    elif scope_name == "主板 (沪深)":
+        picked = code_df[sh_main | sz_main]['code']
+    elif scope_name == "创业板":
+        picked = code_df[cyb]['code']
+    else:
+        raise ValueError(f"未知扫描范围: {scope_name}")
+
+    def to_ticker(code):
+        code = str(code).zfill(6)
+        return f"{code}.SS" if code.startswith('6') else f"{code}.SZ"
+
+    tickers = [to_ticker(c) for c in picked.tolist()]
+    # 去重并保持顺序
+    return list(dict.fromkeys(tickers))
+
+def run_scanner(sector_list, strategy_cls, start_idx=0, total_count=None):
+    """通用扫描器，支持分批增量扫描。"""
     results = []
-    progress_bar = st.progress(0)
+    if total_count is None:
+        total_count = len(sector_list)
+    progress_bar = st.progress(start_idx / max(total_count, 1))
     for i, ticker in enumerate(sector_list):
         try:
             df = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
@@ -462,7 +503,7 @@ def run_scanner(sector_list, strategy_cls):
                     "Score": score
                 })
         except: pass
-        progress_bar.progress((i+1)/len(sector_list))
+        progress_bar.progress((start_idx + i + 1)/max(total_count, 1))
     return pd.DataFrame(results)
 
 # ==========================================
@@ -483,6 +524,15 @@ STRAT_MAP = {
     "HMM 经典标准版": HMMStandardAshare
 }
 CurrentStrategy = STRAT_MAP[strategy_name]
+
+
+if 'scanner_state' not in st.session_state:
+    st.session_state['scanner_state'] = {
+        'offset': 0,
+        'results': pd.DataFrame(),
+        'universe_key': '',
+        'strategy': ''
+    }
 
 if mode == "📈 个股深度分析 (Deep Dive)":
     ticker_in = st.sidebar.text_input("A股代码 (如 600519)", value="600519")
@@ -578,11 +628,72 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                 st.error("数据获取失败，请检查代码。")
 
 elif mode == "📡 板块雷达扫描 (Scanner)":
-    sec_name = st.selectbox("选择赛道", list(SECTORS.keys()))
-    if st.button("开始雷达扫描", type="primary"):
-        with st.spinner(f"正在用 {strategy_name} 扫描 {sec_name}..."):
-            res_df = run_scanner(SECTORS[sec_name], CurrentStrategy)
-            
+    st.subheader("📡 扫描设置")
+    st.caption("新增：可切换到全市场扫描（主板/创业板）。扫描参数位于左侧边栏。")
+    scan_mode = st.sidebar.radio("扫描模式", ["板块扫描", "全市场扫描（主板/创业板）"])
+
+    if scan_mode == "板块扫描":
+        sec_name = st.sidebar.selectbox("选择赛道", list(SECTORS.keys()))
+        universe = SECTORS[sec_name]
+        scan_label = sec_name
+    else:
+        scope = st.sidebar.selectbox("扫描范围", ["全市场 (主板+创业板)", "主板 (沪深)", "创业板"])
+        batch_size = st.sidebar.slider("单批扫描数量（增量）", min_value=100, max_value=1500, value=400, step=100)
+        try:
+            universe = get_market_universe(scope)
+            scan_label = f"{scope}（{len(universe)}只）"
+        except Exception as e:
+            universe = []
+            st.error(f"全市场股票池加载失败：{e}")
+            scan_label = scope
+
+    universe_key = f"{scan_mode}|{scan_label}"
+    state = st.session_state['scanner_state']
+
+    if state['universe_key'] != universe_key or state['strategy'] != strategy_name:
+        state['offset'] = 0
+        state['results'] = pd.DataFrame()
+        state['universe_key'] = universe_key
+        state['strategy'] = strategy_name
+
+    if scan_mode == "全市场扫描（主板/创业板）":
+        st.sidebar.caption(f"进度：{state['offset']} / {len(universe) if universe else 0}")
+        col_a, col_b = st.sidebar.columns(2)
+        start_scan = col_a.button("开始/继续", type="primary")
+        reset_scan = col_b.button("重置进度")
+        if reset_scan:
+            state['offset'] = 0
+            state['results'] = pd.DataFrame()
+            st.sidebar.success("已重置增量扫描进度")
+
+        do_scan = start_scan
+    else:
+        do_scan = st.sidebar.button("开始雷达扫描", type="primary")
+
+    if do_scan:
+        st.info(f"当前扫描模式：{scan_mode} | 范围：{scan_label}")
+        if not universe:
+            st.warning("当前扫描股票池为空，请先修复数据源后重试。")
+        else:
+            if scan_mode == "全市场扫描（主板/创业板）":
+                start = state['offset']
+                end = min(start + batch_size, len(universe))
+                batch = universe[start:end]
+                with st.spinner(f"正在扫描第 {start+1} ~ {end} 只..."):
+                    res_df = run_scanner(batch, CurrentStrategy, start_idx=start, total_count=len(universe))
+                if not res_df.empty:
+                    state['results'] = pd.concat([state['results'], res_df], ignore_index=True)
+                    state['results'] = state['results'].drop_duplicates(subset=['代码'], keep='last')
+                state['offset'] = end
+                res_df = state['results'].copy()
+                if state['offset'] >= len(universe):
+                    st.success("✅ 全市场已扫描完成，可点击重置重新开始。")
+                else:
+                    st.info(f"已完成 {state['offset']} / {len(universe)}，可继续下一批。")
+            else:
+                with st.spinner(f"正在用 {strategy_name} 扫描 {scan_label}..."):
+                    res_df = run_scanner(universe, CurrentStrategy)
+
             if not res_df.empty:
                 res_df = res_df.sort_values(by="Score", ascending=False)
                 
