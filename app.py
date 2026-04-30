@@ -617,15 +617,17 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                 st.error("数据获取失败，请检查代码。")
 
 elif mode == "📡 板块雷达扫描 (Scanner)":
-    scan_mode = st.radio("扫描模式", ["板块扫描", "全市场扫描（主板/创业板）"], horizontal=True)
+    st.subheader("📡 扫描设置")
+    st.caption("新增：可切换到全市场扫描（主板/创业板）。扫描参数位于左侧边栏。")
+    scan_mode = st.sidebar.radio("扫描模式", ["板块扫描", "全市场扫描（主板/创业板）"])
 
     if scan_mode == "板块扫描":
-        sec_name = st.selectbox("选择赛道", list(SECTORS.keys()))
+        sec_name = st.sidebar.selectbox("选择赛道", list(SECTORS.keys()))
         universe = SECTORS[sec_name]
         scan_label = sec_name
     else:
-        scope = st.selectbox("扫描范围", ["全市场 (主板+创业板)", "主板 (沪深)", "创业板"])
-        max_scan = st.slider("单次最大扫描数量（防止超时）", min_value=200, max_value=3000, value=1200, step=100)
+        scope = st.sidebar.selectbox("扫描范围", ["全市场 (主板+创业板)", "主板 (沪深)", "创业板"])
+        max_scan = st.sidebar.slider("单次最大扫描数量（防止超时）", min_value=200, max_value=3000, value=1200, step=100)
         try:
             universe = get_market_universe(scope)
             if len(universe) > max_scan:
@@ -637,7 +639,8 @@ elif mode == "📡 板块雷达扫描 (Scanner)":
             st.error(f"全市场股票池加载失败：{e}")
             scan_label = scope
 
-    if st.button("开始雷达扫描", type="primary"):
+    if st.sidebar.button("开始雷达扫描", type="primary"):
+        st.info(f"当前扫描模式：{scan_mode} | 范围：{scan_label}")
         if not universe:
             st.warning("当前扫描股票池为空，请先修复数据源后重试。")
         else:
