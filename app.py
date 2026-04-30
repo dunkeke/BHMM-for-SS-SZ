@@ -8,6 +8,11 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import warnings
 
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
+
 # 尝试引入鲁棒性模块
 try:
     from robustness import RobustnessLab
@@ -427,6 +432,40 @@ class AshareBacktestEngine:
         dd = (df['Equity_Curve']/df['Equity_Curve'].cummax()-1).min()
         return {"Total Return": total_ret, "CAGR": ann_ret, "Sharpe": sharpe, "Max Drawdown": dd}
 
+
+
+def get_market_universe(scope_name):
+    """获取A股可扫描股票池（主板/创业板）。需要 akshare 支持。"""
+    if ak is None:
+        raise RuntimeError("未安装 akshare，无法进行全市场扫描。请先 `pip install akshare`。")
+
+    code_df = ak.stock_info_a_code_name()
+    if code_df is None or code_df.empty or 'code' not in code_df.columns:
+        raise RuntimeError("股票列表获取失败，请稍后重试。")
+
+    codes = code_df['code'].astype(str).str.zfill(6)
+
+    sh_main = codes.str.startswith(("600", "601", "603", "605"))
+    sz_main = codes.str.startswith(("000", "001", "002"))
+    cyb = codes.str.startswith(("300", "301"))
+
+    if scope_name == "全市场 (主板+创业板)":
+        picked = code_df[sh_main | sz_main | cyb]['code']
+    elif scope_name == "主板 (沪深)":
+        picked = code_df[sh_main | sz_main]['code']
+    elif scope_name == "创业板":
+        picked = code_df[cyb]['code']
+    else:
+        raise ValueError(f"未知扫描范围: {scope_name}")
+
+    def to_ticker(code):
+        code = str(code).zfill(6)
+        return f"{code}.SS" if code.startswith('6') else f"{code}.SZ"
+
+    tickers = [to_ticker(c) for c in picked.tolist()]
+    # 去重并保持顺序
+    return list(dict.fromkeys(tickers))
+
 def run_scanner(sector_list, strategy_cls):
     """通用扫描器"""
     results = []
@@ -578,11 +617,36 @@ if mode == "📈 个股深度分析 (Deep Dive)":
                 st.error("数据获取失败，请检查代码。")
 
 elif mode == "📡 板块雷达扫描 (Scanner)":
-    sec_name = st.selectbox("选择赛道", list(SECTORS.keys()))
-    if st.button("开始雷达扫描", type="primary"):
-        with st.spinner(f"正在用 {strategy_name} 扫描 {sec_name}..."):
-            res_df = run_scanner(SECTORS[sec_name], CurrentStrategy)
-            
+    st.subheader("📡 扫描设置")
+    st.caption("新增：可切换到全市场扫描（主板/创业板）。扫描参数位于左侧边栏。")
+    scan_mode = st.sidebar.radio("扫描模式", ["板块扫描", "全市场扫描（主板/创业板）"])
+
+    if scan_mode == "板块扫描":
+        sec_name = st.sidebar.selectbox("选择赛道", list(SECTORS.keys()))
+        universe = SECTORS[sec_name]
+        scan_label = sec_name
+    else:
+        scope = st.sidebar.selectbox("扫描范围", ["全市场 (主板+创业板)", "主板 (沪深)", "创业板"])
+        max_scan = st.sidebar.slider("单次最大扫描数量（防止超时）", min_value=200, max_value=3000, value=1200, step=100)
+        try:
+            universe = get_market_universe(scope)
+            if len(universe) > max_scan:
+                st.caption(f"当前范围共 {len(universe)} 只，已按前序截取 {max_scan} 只进行扫描。")
+                universe = universe[:max_scan]
+            scan_label = f"{scope}（{len(universe)}只）"
+        except Exception as e:
+            universe = []
+            st.error(f"全市场股票池加载失败：{e}")
+            scan_label = scope
+
+    if st.sidebar.button("开始雷达扫描", type="primary"):
+        st.info(f"当前扫描模式：{scan_mode} | 范围：{scan_label}")
+        if not universe:
+            st.warning("当前扫描股票池为空，请先修复数据源后重试。")
+        else:
+            with st.spinner(f"正在用 {strategy_name} 扫描 {scan_label}..."):
+                res_df = run_scanner(universe, CurrentStrategy)
+
             if not res_df.empty:
                 res_df = res_df.sort_values(by="Score", ascending=False)
                 
